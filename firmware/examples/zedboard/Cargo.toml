@@ -14,7 +14,7 @@ categories = ["embedded", "no-std", "hardware-support"]
 aarch32-cpu = { version = "0.3", features = ["critical-section-single-core"] }
 zynq7000-rt = { path = "../../zynq7000-rt" }
 zynq7000 = { path = "../../zynq7000" }
-zynq7000-hal = { path = "../../zynq7000-hal", features = ["time-driver-gtc"] }
+zynq7000-hal = { path = "../../zynq7000-hal", features = ["defmt", "time-driver-gtc"] }
 zedboard-bsp = { path = "../../zedboard-bsp" }
 num_enum = { version = "0.7", default-features = false }
 l3gd20 = { git = "https://github.com/us-irs/l3gd20.git", branch = "add-async-if" }
@@ -37,11 +37,14 @@ ssd1306 = { version = "0.10", features = ["async"] }
 tinybmp = "0.7"
 rand = { version = "0.10", default-features = false }
 
-embassy-executor = { version = "0.10", features = ["platform-cortex-ar", "executor-thread"] }
-embassy-time = { version = "0.5", features = ["tick-hz-1_000_000"] }
-embassy-net = { version = "0.9", features = ["dhcpv4", "packet-trace", "medium-ethernet", "icmp", "tcp", "udp", "auto-icmp-echo-reply"] }
+embassy-executor = { version = "0.10", features = ["defmt", "platform-cortex-ar", "executor-thread"] }
+embassy-time = { version = "0.5", features = ["defmt", "tick-hz-1_000_000"] }
+embassy-net = { version = "0.9", features = ["defmt", "dhcpv4", "packet-trace", "medium-ethernet", "icmp", "tcp", "udp", "auto-icmp-echo-reply"] }
 embedded-sdmmc = { git = "https://github.com/robamu/embedded-sdmmc-rs.git", branch = "all-features" }
-embassy-sync = { version = "0.8" }
+embassy-sync = { version = "0.8", features=["defmt"] }
 heapless = "0.9"
 axi-uartlite = { version = "0.1" }
 axi-uart16550 = { version = "0.1" }
+
+defmt = "1.1.0"
+defmt-rtt = "1.2.0"

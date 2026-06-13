@@ -31,37 +31,39 @@ use embassy_net::{Ipv4Cidr, StaticConfigV4, tcp::TcpSocket, udp::UdpSocket};
 use embassy_time::{Duration, Timer};
 use embedded_io::Write;
 use embedded_io_async::Write as _;
-use log::{LevelFilter, debug, error, info, warn};
 use rand::{Rng, SeedableRng};
 use zedboard::PS_CLOCK_FREQUENCY;
-use zedboard_bsp::phy_marvell;
 use zynq7000_hal::{
     BootMode,
     clocks::Clocks,
     configure_level_shifter,
     eth::{
         AlignedBuffer, ClockDivSet, EthernetConfig, EthernetLowLevel, embassy_net::InterruptResult,
+        Speed, Duplex,
     },
     generic_interrupt_handler,
     gic::{Configurator, Interrupt},
     gpio::{GpioPins, Output, PinState},
     gtc::GlobalTimerCounter,
     l2_cache,
-    uart::{ClockConfig, Config, Uart},
 };
 
 use zynq7000::{Peripherals, slcr::LevelShifterConfig};
 use zynq7000_rt::{self as _, mmu::section_attrs::SHAREABLE_DEVICE, mmu_l1_table_mut};
+use defmt_rtt as _;
 
-const USE_DHCP: bool = true;
+#[used]
+#[unsafe(no_mangle)]
+static FIRMWARE_COMMIT: &'static str = "55e6b5a0ae23878dc10c644a613d7072de861110";
+
+const USE_DHCP: bool = false;
 const UDP_AND_TCP_PORT: u16 = 8000;
 const PRINT_PACKET_STATS: bool = false;
-const LOG_LEVEL: LevelFilter = LevelFilter::Info;
 const NUM_RX_SLOTS: usize = 16;
 const NUM_TX_SLOTS: usize = 16;
 
 const STATIC_IPV4_CONFIG: StaticConfigV4 = StaticConfigV4 {
-    address: Ipv4Cidr::new(Ipv4Addr::new(192, 168, 179, 25), 24),
+    address: Ipv4Cidr::new(Ipv4Addr::new(10, 0, 0, 25), 24),
     gateway: None,
     dns_servers: heapless::Vec::new(),
 };
@@ -71,8 +73,8 @@ const INIT_STRING: &str = "-- Zynq 7000 Zedboard Ethernet Example --\n\r";
 // Unicast address with OUI of the Marvell 88E1518 PHY.
 const MAC_ADDRESS: [u8; 6] = [
     0x00,
-    ((phy_marvell::MARVELL_88E1518_OUI >> 8) & 0xff) as u8,
-    (phy_marvell::MARVELL_88E1518_OUI & 0xff) as u8,
+    0x12,
+    0x34,
     0x00,
     0x00,
     0x01,
@@ -125,19 +127,23 @@ async fn udp_task(mut udp: UdpSocket<'static>) -> ! {
     udp.bind(UDP_AND_TCP_PORT)
         .expect("failed to bind UDP socket to port 8000");
     loop {
+            udp.send_to_with(
+                1472,
+                embassy_net::IpEndpoint::new(embassy_net::IpAddress::v4(10, 0, 0, 1), 1735),
+                |buf| (1472, ()),
+            )
+            .await;
+            continue;
         match udp.recv_from(&mut rx_buf).await {
             Ok((data, meta)) => {
-                log::info!("udp rx {data} bytes from {meta:?}");
                 match udp.send_to(&rx_buf[0..data], meta).await {
                     Ok(_) => (),
                     Err(e) => {
-                        log::warn!("udp send error: {e:?}");
                         Timer::after_millis(100).await;
                     }
                 }
             }
             Err(e) => {
-                log::warn!("udp receive error: {e:?}");
                 Timer::after_millis(100).await;
             }
         }
@@ -152,48 +158,46 @@ async fn tcp_task(mut tcp: TcpSocket<'static>) -> ! {
     loop {
         match tcp.accept(UDP_AND_TCP_PORT).await {
             Ok(_) => {
-                log::info!("tcp connection to {:?} accepted", tcp.remote_endpoint());
+                defmt::info!("tcp connection to {:?} accepted", tcp.remote_endpoint());
                 loop {
                     if tcp.may_recv() {
                         match tcp.read(&mut rx_buf).await {
                             Ok(0) => {
-                                log::info!("tcp EOF received");
+                                defmt::info!("tcp EOF received");
                                 tcp.close();
                             }
                             Ok(read_bytes) => {
-                                log::info!("tcp rx {read_bytes} bytes");
+                                //defmt::info!("tcp rx {read_bytes} bytes");
                                 if tcp.may_send() {
                                     match tcp.write_all(&rx_buf[0..read_bytes]).await {
                                         Ok(_) => continue,
                                         Err(e) => {
-                                            log::warn!("tcp error when writing: {e:?}");
                                             Timer::after_millis(100).await;
                                         }
                                     }
                                 } else {
-                                    log::warn!("tcp remote endpoint not writeable");
+                                    defmt::warn!("tcp remote endpoint not writeable");
                                     continue;
                                 }
                             }
                             Err(_) => {
-                                log::warn!("tcp connection reset by remote endpoint.");
+                                defmt::warn!("tcp connection reset by remote endpoint.");
                                 tcp.close();
                             }
                         }
                     }
                     if !tcp.may_send() && !tcp.may_recv() {
-                        log::info!("tcp send and receive side closed");
+                        defmt::info!("tcp send and receive side closed");
                         tcp.close();
                     }
                     if tcp.state() == embassy_net::tcp::State::Closed {
-                        log::info!("tcp socket closed, exiting loop");
+                        defmt::info!("tcp socket closed, exiting loop");
                         break;
                     }
                     Timer::after_millis(100).await;
                 }
             }
             Err(e) => {
-                log::warn!("tcp error accepting connection: {e:?}");
                 Timer::after_millis(100).await;
                 continue;
             }
@@ -203,6 +207,7 @@ async fn tcp_task(mut tcp: TcpSocket<'static>) -> ! {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) -> ! {
+    defmt::info!("starting");
     let mut dp = Peripherals::take().unwrap();
     l2_cache::init_with_defaults(&mut dp.l2c);
 
@@ -224,28 +229,13 @@ async fn main(spawner: Spawner) -> ! {
     unsafe {
         gic.enable_interrupts();
     }
-    let gpio_pins = GpioPins::new(dp.gpio);
 
     // Set up global timer counter and embassy time driver.
     let gtc = GlobalTimerCounter::new(dp.gtc, clocks.arm_clocks());
     zynq7000_hal::time_driver_gtc::init(clocks.arm_clocks(), gtc);
 
-    // Set up the UART, we are logging with it.
-    let uart_clk_config = ClockConfig::new_autocalc_with_error(clocks.io_clocks(), 115200)
-        .unwrap()
-        .0;
-    let mut uart = Uart::new_with_mio_for_uart_1(
-        dp.uart_1,
-        Config::new_with_clk_config(uart_clk_config),
-        (gpio_pins.mio.mio48, gpio_pins.mio.mio49),
-    )
-    .unwrap();
-    uart.write_all(INIT_STRING.as_bytes()).unwrap();
-    // Safety: We are not multi-threaded yet.
-    zynq7000_hal::log::uart_blocking::init_with_busy_flag(uart, LOG_LEVEL, false);
-
     let boot_mode = BootMode::new_from_regs();
-    info!("Boot mode: {:?}", boot_mode);
+    //defmt::info!("Boot mode: {:?}", boot_mode);
 
     static ETH_RX_BUFS: static_cell::ConstStaticCell<[AlignedBuffer; NUM_RX_SLOTS]> =
         static_cell::ConstStaticCell::new(
@@ -272,14 +262,10 @@ async fn main(spawner: Spawner) -> ! {
     // Unwrap okay, this is a valid peripheral.
     let eth_ll = EthernetLowLevel::new(dp.eth_0).unwrap();
     let mod_id = eth_ll.regs.read_module_id();
-    info!("Ethernet Module ID: {mod_id:?}");
+    //info!("Ethernet Module ID: {mod_id:?}");
     assert_eq!(mod_id, 0x20118);
 
     let (clk_divs, clk_errors) = ClockDivSet::calculate_for_rgmii_and_io_clock(clocks.io_clocks());
-    debug!(
-        "Calculated RGMII clock configuration: {:?}, errors (missmatch from ideal rate in hertz): {:?}",
-        clk_divs, clk_errors
-    );
 
     zynq7000_hal::register_interrupt(
         Interrupt::Spi(zynq7000_hal::gic::SpiInterrupt::Eth0),
@@ -288,45 +274,22 @@ async fn main(spawner: Spawner) -> ! {
 
     // Unwrap okay, we use a standard clock config, and the clock config should never fail.
     let eth_cfg = EthernetConfig::new(
-        zynq7000_hal::eth::ClockConfig::new(clk_divs.cfg_1000_mbps),
+        zynq7000_hal::eth::ClockConfig {
+            src_sel: zynq7000::slcr::clocks::SrcSelIo::IoPll,
+            use_emio_tx_clk: true,
+            divs: clk_divs.cfg_1000_mbps,
+            enable: true,
+        },
         zynq7000_hal::eth::calculate_mdc_clk_div(clocks.arm_clocks()).unwrap(),
         MAC_ADDRESS,
     );
     // Configures all the physical pins for ethernet operation and sets up the
     // ethernet peripheral.
-    let mut eth = zynq7000_hal::eth::Ethernet::new_with_mio_eth_0(
-        eth_ll,
-        eth_cfg,
-        gpio_pins.mio.mio16,
-        gpio_pins.mio.mio21,
-        (
-            gpio_pins.mio.mio17,
-            gpio_pins.mio.mio18,
-            gpio_pins.mio.mio19,
-            gpio_pins.mio.mio20,
-        ),
-        gpio_pins.mio.mio22,
-        gpio_pins.mio.mio27,
-        (
-            gpio_pins.mio.mio23,
-            gpio_pins.mio.mio24,
-            gpio_pins.mio.mio25,
-            gpio_pins.mio.mio26,
-        ),
-        Some((gpio_pins.mio.mio52, gpio_pins.mio.mio53)),
-    );
+    let mut eth = zynq7000_hal::eth::Ethernet::new( eth_ll, eth_cfg, );
 
     eth.set_rx_buf_descriptor_base_address(rx_descr_ref.base_addr());
     eth.set_tx_buf_descriptor_base_address(tx_descr_ref.base_addr());
     eth.start();
-    let (mut phy, phy_rev) = phy_marvell::Marvell88E1518Phy::new_autoprobe_addr(eth.mdio_mut())
-        .expect("could not auto-detect phy");
-    info!(
-        "Detected Marvell 88E1518 PHY with revision number: {:?}",
-        phy_rev
-    );
-    phy.reset();
-    phy.restart_auto_negotiation();
 
     let driver = zynq7000_hal::eth::embassy_net::Driver::new(
         &eth,
@@ -354,8 +317,8 @@ async fn main(spawner: Spawner) -> ! {
         rng.next_u64(),
     );
 
-    const N_SLOTS: usize = 8;
-    const BUFSIZE: usize = N_SLOTS * 1024;
+    const N_SLOTS: usize = 6;
+    const BUFSIZE: usize = 16 * 1024;
 
     // Ensure those are in the data section by making them static.
     static RX_UDP_META: static_cell::ConstStaticCell<[embassy_net::udp::PacketMetadata; N_SLOTS]> =
@@ -388,8 +351,6 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(udp_task(udp_socket).unwrap());
     spawner.spawn(tcp_task(tcp_socket).unwrap());
 
-    let mut mio_led = Output::new_for_mio(gpio_pins.mio.mio7, PinState::Low);
-
     let mut ip_mode = IpMode::LinkDown;
     let mut transmitted_frames = 0;
     let mut received_frames = 0;
@@ -397,18 +358,15 @@ async fn main(spawner: Spawner) -> ! {
     loop {
         // Handle error messages from ethernet interrupt.
         while let Ok(msg) = receiver.try_receive() {
-            info!("Received interrupt result: {msg:?}");
         }
         if PRINT_PACKET_STATS {
             let sent_frames_since_last = eth.ll().regs.statistics().read_tx_count();
             if sent_frames_since_last > 0 {
                 transmitted_frames += sent_frames_since_last;
-                info!("Frame sent count: {transmitted_frames}");
             }
             let received_frames_since_last = eth.ll().regs.statistics().read_rx_count();
             if received_frames_since_last > 0 {
                 received_frames += received_frames_since_last;
-                info!("Frame received count: {received_frames}");
             }
         }
 
@@ -417,55 +375,29 @@ async fn main(spawner: Spawner) -> ! {
         match ip_mode {
             // Assuming that auto-negotiation is performed automatically.
             IpMode::LinkDown => {
-                mio_led.set_low();
+                //mio_led.set_low();
                 zynq7000_hal::eth::embassy_net::update_link_state(
                     embassy_net::driver::LinkState::Down,
                 );
                 ip_mode = IpMode::AutoNegotiating;
             }
             IpMode::AutoNegotiating => {
-                let status = phy.read_copper_status();
-                if status.auto_negotiation_complete() {
-                    let extended_status = phy.read_copper_specific_status_register_1();
-                    info!(
-                        "link is up and auto-negotiation complete. Setting speed {:?} and duplex {:?}",
-                        extended_status.speed().as_zynq7000_eth_speed().unwrap(),
-                        extended_status.duplex().as_zynq7000_eth_duplex()
-                    );
-                    eth.configure_clock_and_speed_duplex(
-                        // If this has the reserved bits, what do we even do? For this example app,
-                        // I am going to assume this never happens..
-                        extended_status.speed().as_zynq7000_eth_speed().unwrap(),
-                        extended_status.duplex().as_zynq7000_eth_duplex(),
-                        &clk_divs,
-                    );
-                    zynq7000_hal::eth::embassy_net::update_link_state(
-                        embassy_net::driver::LinkState::Up,
-                    );
-                    ip_mode = IpMode::AwaitingIpConfig;
-                } else {
-                    Timer::after_millis(100).await;
-                }
+                eth.configure_clock_and_speed_duplex(Speed::Mbps1000, Duplex::Full, &clk_divs);
+                zynq7000_hal::eth::embassy_net::update_link_state(
+                    embassy_net::driver::LinkState::Up,
+                );
+                ip_mode = IpMode::AwaitingIpConfig;
             }
             IpMode::AwaitingIpConfig => {
                 if stack.is_config_up() {
                     let network_config = stack.config_v4();
-                    info!("Network configuration is up. config: {network_config:?}!",);
+                    defmt::info!("Network configuration is up");
                     ip_mode = IpMode::StackReady;
-                    mio_led.set_high();
                 } else {
                     Timer::after_millis(100).await;
                 }
             }
             IpMode::StackReady => {
-                let status = phy.read_copper_status();
-                // Periodically check for link changes.
-                if status.copper_link_status() == phy_marvell::LatchingLinkStatus::DownSinceLastRead
-                {
-                    warn!("ethernet link is down.");
-                    ip_mode = IpMode::LinkDown;
-                    continue;
-                }
                 Timer::after_millis(100).await;
             }
         }
@@ -487,8 +419,8 @@ unsafe fn custom_eth_interupt_handler() {
 pub fn irq_handler() {
     // Safety: Called here once.
     let result = unsafe { generic_interrupt_handler() };
-    if let Err(e) = result {
-        panic!("Generic interrupt handler failed handling {:?}", e);
+    if let Err(_) = result {
+        defmt::error!("Generic interrupt handler failed handling");
     }
 }
 
@@ -516,6 +448,6 @@ fn prefetch_handler(_faulting_addr: usize) -> ! {
 /// Panic handler
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    error!("Panic: {info:?}");
+    defmt::error!("Panic: {:?}", info);
     loop {}
 }
